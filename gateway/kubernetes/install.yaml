@@ -1,0 +1,354 @@
+apiVersion: v1
+data:
+  config.yaml: |
+    api:
+      dashboard: true
+      insecure: true
+    providers:
+      file:
+        directory: /etc/traefik/conf/conf.d/
+        watch: true
+
+    entryPoints:
+      web:
+        address: ":8090"
+      metrics:
+        address: ":9090"
+    log:
+      format: common
+
+    accessLog:
+      format: common
+
+    metrics:
+      prometheus:
+        entryPoint: metrics
+        addServicesLabels: true
+kind: ConfigMap
+metadata:
+  name: traefik
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: detection-tool
+  name: detection-tool
+spec:
+  ports:
+  - name: detection-tcp
+    port: 8000
+    targetPort: 8000
+  selector:
+    app: detection-tool
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: digger
+  name: digger
+spec:
+  ports:
+  - name: digger-tcp
+    port: 9000
+    targetPort: 9000
+  - name: digger-metrics
+    port: 9090
+    targetPort: 9090
+  selector:
+    app: digger
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: kafka
+  name: kafka
+spec:
+  clusterIP: None
+  ports:
+  - name: kafka-tcp
+    port: 9092
+    targetPort: 9092
+  - name: zookeeper-tcp
+    port: 2181
+    targetPort: 2181
+  selector:
+    app: kafka
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: traefik-proxy
+  name: traefik-proxy
+spec:
+  ports:
+  - name: traefik-proxy
+    port: 8090
+    targetPort: 8090
+  selector:
+    app: traefik-proxy
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: detection-tool
+  name: detection-tool
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: detection-tool
+  template:
+    metadata:
+      labels:
+        app: detection-tool
+    spec:
+      containers:
+      - image: soveren/detection-tool:v0.1.0-beta
+        imagePullPolicy: IfNotPresent
+        name: detection-tool
+        ports:
+        - containerPort: 8000
+          name: detection-tcp
+        readinessProbe:
+          tcpSocket:
+            port: 8000
+          timeoutSeconds: 3
+        resources:
+          limits:
+            cpu: 500m
+            memory: 2048Mi
+          requests:
+            cpu: 250m
+            memory: 1024Mi
+      restartPolicy: Always
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: digger
+  name: digger
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: digger
+  template:
+    metadata:
+      annotations:
+        prometheus.io/port: "9090"
+        prometheus.io/scrape: "true"
+      labels:
+        app: digger
+    spec:
+      containers:
+      - env:
+        - name: SVRN_DIGGER_STATSCLIENT_TOKEN
+          valueFrom:
+            secretKeyRef:
+              key: token
+              name: soveren-proxy-token
+        - name: SVRN_DIGGER_STATSCLIENT_CLIENT_ADDRESS
+          value: stats.soveren.io:443
+        - name: SVRN_DIGGER_STATSCLIENT_CLIENT_TIMEOUT
+          value: 10s
+        - name: SVRN_DIGGER_STATSCLIENT_CLIENT_USETLS
+          value: "true"
+        - name: SVRN_DIGGER_STATSCLIENT_CLIENT_INSECURE
+          value: "false"
+        - name: SVRN_DIGGER_STOPTIMEOUT
+          value: 60s
+        - name: SVRN_DIGGER_LOG_FORMATTER
+          value: text
+        - name: SVRN_DIGGER_PRESIDIO_ANALYZERURI
+          value: http://detection-tool:8000/api/v1/request
+        - name: SVRN_DIGGER_KAFKA_BROKERS
+          value: kafka:9092
+        - name: SVRN_DIGGER_KAFKA_CONSUMERGROUP
+          value: worker_1
+        - name: SVRN_DIGGER_KAFKA_HANDLERNAME
+          value: worker_1
+        - name: SVRN_DIGGER_KAFKA_TOPIC
+          value: events
+        - name: SVRN_DIGGER_KAFKA_RESENDSLEEP
+          value: 1s
+        - name: SVRN_DIGGER_INSTRUMENTATION_LISTENADDRESS
+          value: 0.0.0.0:9000
+        image: soveren/digger:v0.1.0-beta
+        imagePullPolicy: IfNotPresent
+        name: digger
+        ports:
+        - containerPort: 9000
+          name: digger
+        - containerPort: 9090
+          name: digger-metrics
+        readinessProbe:
+          tcpSocket:
+            port: 9000
+          timeoutSeconds: 3
+        resources:
+          limits:
+            cpu: 100m
+            memory: 128Mi
+          requests:
+            cpu: 50m
+            memory: 64Mi
+      initContainers:
+      - args:
+        - -c
+        - for attempt in {1..60}; do sleep 2; nc -zvw5 kafka 9092 && break; done
+        image: bash:5.1.4
+        name: check-kafka-ready
+      - args:
+        - -c
+        - for attempt in {1..60}; do sleep 2; nc -zvw5 detection-tool 8000 && break;
+          done
+        image: bash:5.1.4
+        name: check-detection-ready
+      restartPolicy: Always
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: kafka
+  name: kafka
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kafka
+  template:
+    metadata:
+      labels:
+        app: kafka
+    spec:
+      containers:
+      - env:
+        - name: ALLOW_PLAINTEXT_LISTENER
+          value: "yes"
+        - name: KAFKA_CFG_ZOOKEEPER_CONNECT
+          value: kafka:2181
+        - name: MY_POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: KAFKA_ADVERTISED_LISTENERS
+          value: PLAINTEXT://$(MY_POD_IP):9092
+        image: docker.io/bitnami/kafka:2
+        imagePullPolicy: Always
+        lifecycle:
+          preStop:
+            exec:
+              command:
+              - sh
+              - -ce
+              - kill -s TERM 1; while $(kill -0 1 2>/dev/null); do sleep 1; done
+        name: kafka
+        ports:
+        - containerPort: 9092
+        resources:
+          limits:
+            memory: 600Mi
+          requests:
+            cpu: 100m
+            memory: 100Mi
+        volumeMounts:
+        - mountPath: /bitnami
+          name: kafka-data
+      - env:
+        - name: ALLOW_ANONYMOUS_LOGIN
+          value: "yes"
+        image: docker.io/bitnami/zookeeper:3.7
+        imagePullPolicy: Always
+        name: zookeeper
+        ports:
+        - containerPort: 2181
+        readinessProbe:
+          periodSeconds: 30
+          tcpSocket:
+            port: 2181
+          timeoutSeconds: 2
+        resources:
+          limits:
+            memory: 120Mi
+          requests:
+            cpu: 10m
+            memory: 100Mi
+        volumeMounts:
+        - mountPath: /bitnami
+          name: zookeeper-data
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30
+      volumes:
+      - emptyDir: {}
+        name: kafka-data
+      - emptyDir: {}
+        name: zookeeper-data
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: traefik-proxy
+  name: traefik-proxy
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: traefik-proxy
+  template:
+    metadata:
+      annotations:
+        prometheus.io/port: "9090"
+        prometheus.io/scrape: "true"
+      labels:
+        app: traefik-proxy
+    spec:
+      containers:
+      - args:
+        - traefik
+        - --configfile=/etc/traefik/conf/config.yaml
+        image: soveren/gateway:v0.1.0-beta
+        imagePullPolicy: IfNotPresent
+        name: traefik-proxy
+        ports:
+        - containerPort: 8090
+          name: http
+        - containerPort: 9090
+          name: metrics
+        readinessProbe:
+          tcpSocket:
+            port: 8090
+          timeoutSeconds: 3
+        resources:
+          limits:
+            cpu: 100m
+            memory: 128Mi
+          requests:
+            cpu: 50m
+            memory: 64Mi
+        volumeMounts:
+        - mountPath: /etc/traefik/conf/
+          name: traefik-config
+        - mountPath: /etc/traefik/conf/conf.d/
+          name: replicator
+      initContainers:
+      - args:
+        - -c
+        - for attempt in {1..60}; do sleep 2; nc -zvw5 kafka 9092 && break; done
+        image: bash:5.1.4
+        name: check-kafka-ready
+      restartPolicy: Always
+      volumes:
+      - configMap:
+          name: traefik
+        name: traefik-config
+      - configMap:
+          name: replicator
+        name: replicator

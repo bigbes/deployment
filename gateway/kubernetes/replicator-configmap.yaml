@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: replicator
+  labels:
+    app: traefik-proxy
+data:
+  replicator.yaml: |
+    http:
+      # Add the router
+      routers:
+        defaults:
+          entryPoints:
+            - web
+          rule: PathPrefix(`/`)
+          middlewares:
+            - soveren
+          service: upstream
+
+      # Add the middleware
+      middlewares:
+        soveren:
+          replicate:
+            topic: events
+            brokers:
+              - kafka:9092
+
+      # Add the service
+      services:
+        upstream:
+          loadBalancer:
+            servers:
+              - url: http://host:80/
